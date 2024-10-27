@@ -1,6 +1,8 @@
 import json
 import time
 import os
+import asyncio
+from concurrent.futures.thread import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from dateutil.relativedelta import relativedelta
@@ -10,8 +12,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tkinter import Tk, Button, Label
-from selenium.webdriver.common.keys import Keys
-
+from constants import *
 from parser_json import order_json
 
 TRANSACTIONS = []
@@ -28,11 +29,16 @@ def get_element(driver, xpath: str, timeout: int = 10, raise_error: bool = True)
     else:
         return element
 
-def get_element_by_class(driver, class_name: str, timeout: int = 10):
-    element = WebDriverWait(driver, timeout).until(
-        EC.visibility_of_element_located((By.CLASS_NAME, class_name))
-    )
-    return element
+def get_element_by_class(driver, class_name: str, timeout: int = 10, raise_error: bool = True):
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.CLASS_NAME, class_name))
+        )
+    except TimeoutException as e:
+        if raise_error:
+            raise e
+    else:
+        return element
 
 def create_popup():
     popup = Tk()
@@ -73,7 +79,7 @@ def format_price(raw_price: str):
     price = raw_price.replace('R$ ', '')
     return format_number(price)
 
-def format_transaction(transaction, raw_trx_dt: str):
+async def format_transaction(transaction, raw_trx_dt: str):
     raw_in_out = transaction.find_element(By.CLASS_NAME, 'cdk-column-tipoOperacao').text
     raw_type = transaction.find_element(By.CLASS_NAME, 'cdk-column-tipoMovimentacaoFormatado').text
     raw_product = transaction.find_element(By.CLASS_NAME, 'cdk-column-nomeProduto').text
@@ -94,70 +100,66 @@ def format_transaction(transaction, raw_trx_dt: str):
         'date': format_dt(raw_trx_dt)
     }
 
-def get_assets(driver):
-    assets_dt = driver.find_elements(By.CLASS_NAME, "tabela-desktop")
+async def thread_asset(transaction_content):
+    raw_transaction_dt = transaction_content.text.split("\n")[0]
+    transactions = transaction_content.find_elements(By.CLASS_NAME, "cdk-row")
 
+    for transaction in transactions:
+        formatted_transaction = await format_transaction(transaction, raw_transaction_dt)
+        TRANSACTIONS.append(formatted_transaction)
+
+async def get_assets(driver):
+    assets_dt = get_element_by_class(driver, class_name="tabela-desktop", raise_error=False)
     if assets_dt:
+        assets_dt_elements = driver.find_elements(By.CLASS_NAME, "tabela-desktop")
 
-        time.sleep(2)
-
-        all_transactions = []
-
-        for transaction_content in assets_dt:
-            raw_transaction_dt = transaction_content.text.split("\n")[0]
-
-            print(f'Buscando transações do dia {raw_transaction_dt.lower()}...')
-
+        trxs = 0
+        for transaction_content in assets_dt_elements:
             transactions = transaction_content.find_elements(By.CLASS_NAME, "cdk-row")
-            for transaction in transactions:
-                formatted_transaction = format_transaction(transaction, raw_transaction_dt)
-                # all_transactions.append(formatted_transaction)
+            trxs += len(transactions)
 
-                TRANSACTIONS.append(formatted_transaction)
+        print(f'> Processando {trxs} transações encontradas, aguarde...')
+
+        # Executa o filtro de forma assíncrona
+        await asyncio.gather(*(thread_asset(transaction_content) for transaction_content in assets_dt_elements))
+
+    else:
+        print(f'> Nenhuma transação encontrada.')
+
+    return assets_dt
 
 
 def abrir_tela_movimentacao(driver):
-    # Pega o elemento e faz login
-    element = get_element(driver, "//*[@id='investidor']")
-    element.click()
-    element.send_keys(os.getenv('USER'))
+    input_usuario = click_element(driver, xpath=USER_INPUT_XPATH)
+    input_usuario.send_keys(os.getenv('USER'))
 
-    element = get_element(driver, "/html/body/app-root/app-landing-page/div/div[2]/aside/form/b3-button[1]/button/div")
-    element.click()
+    # enter button
+    click_element(driver, xpath=ENTER_BUTTON_XPATH)
 
-    element = get_element(driver, "//*[@id='PASS_INPUT']")
-    element.click()
-    element.send_keys(os.getenv('PASS'))
+    input_pass = click_element(driver, xpath=PASSWORD_INPUT_XPATH)
+    input_pass.click()
+    input_pass.send_keys(os.getenv('PASS'))
 
     # Chama a função para exibir o popup e aguarda ele ser fechado
     create_popup()
 
-    # Continuar execução após o popup ser fechado
-
     # ENTER
-    element = get_element(driver, "//*[@id='Btn_CONTINUE']")
-    element.click()
+    click_element(driver, xpath=CONTINUE_BUTTON_XPATH)
 
     # REJEITA COOKIES
-    element = get_element(driver, "//*[@id='onetrust-reject-all-handler']")
-    time.sleep(2)
-    element.click()
+    click_element(driver, xpath=REJECT_COOKIES_XPATH)
 
     # PULAR TOUR
-    element = get_element(driver,
-                          "/html/body/app-root/app-core/app-tour-guiado-inicio/div/div/div/b3-button[1]/button/div/span")
-    time.sleep(2)
-    element.click()
+    click_element(driver, xpath=SKIP_TOUR_XPATH)
 
     # ACESSAR MOVIMENTAÇÃO
-    driver.get("https://www.investidor.b3.com.br/extrato/movimentacao")
-    time.sleep(5)
+    driver.get(MOVIMENTACAO_URL)
 
 def click_element(driver, xpath):
     element = get_element(driver, xpath)
     time.sleep(1)
     element.click()
-    time.sleep(1)
+    return element
 
 
 def get_date_filters(start_date_limit: str, end_date_limit: str):
@@ -179,102 +181,86 @@ def get_date_filters(start_date_limit: str, end_date_limit: str):
 
         dt_control = e_dt + timedelta(days=1)
 
-    # dt_filters.append({'start_date': dt_control, 'end_date': end_date})
     return dt_filters
 
+async def thread_filter(driver, dt_filter):
+    input_start_element = get_element_by_class(driver, "input-start")
+    input_start_element.clear()
+    input_start_element.send_keys(dt_filter['start_date'].strftime('%d%m%Y'))
 
-def definir_filtros(driver):
+    input_end_element = get_element_by_class(driver, "input-end")
+    input_end_element.clear()
+    input_end_element.send_keys(dt_filter['end_date'].strftime('%d%m%Y'))
+
+    print(f"\nFiltrando transações entre os dias {dt_filter['start_date'].strftime('%d/%m/%Y')} e {dt_filter['end_date'].strftime('%d/%m/%Y')}")
+    click_element(driver=driver, xpath=MODAL_FILTER_BUTTON_XPATH)
+
+    await get_assets(driver)
+
+    pagination_element = get_element(driver, xpath="//*[@id='paginacao-extrato-movimentacao']", raise_error=False)
+    if pagination_element:
+        next_page_element = get_element(driver, xpath=NEXT_PAGE_BUTTON_XPATH, raise_error=False)
+        if next_page_element:
+            print('> Navegando para a próxima página, aguarde...')
+            next_page_element.click()
+
+            while next_page_element:
+                await get_assets(driver)
+                next_page_element = get_element(driver, xpath=NEXT_PAGE_BUTTON_XPATH, raise_error=False)
+                try:
+                    next_page_element.click()
+                    print('> Navegando para a próxima página, aguarde...')
+                except ElementClickInterceptedException:
+                    print('> Finalizado a navegação entre páginas.')
+                    next_page_element = None
+
+    # abre o filtro novamente
+    click_element(driver=driver, xpath=FILTER_BUTTON_XPATH)
+
+async def definir_filtros(driver):
+    start_time = time.time()
+
     # clica no botão filtrar
-    click_element(driver, "/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/div/app-tabela-filtro/div/div/b3-button[1]/button")
+    click_element(driver, xpath=FILTER_BUTTON_XPATH)
 
     # obtem data limite inferior
-    element = get_element(driver, "/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/app-movimentacao-filtrar/div/b3-modal-drawer/div[1]/div[2]/div/div[1]/div/div[2]/div[1]/p")
-    str_dt_limit = element.text.split(" ")[-1].strip('.')
+    start_raw_date_element = get_element(driver=driver, xpath=START_LIMIT_STRING_XPATH)
+    start_date = start_raw_date_element.text.split(" ")[-1].strip('.')
 
     # obtem data limite superior
     input_end_element = get_element_by_class(driver, "input-end")
     input_end_element.clear()
     input_end_element.send_keys(datetime.now().strftime('%d%m%Y'))
 
-    element = get_element(driver, '/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/app-movimentacao-filtrar/div/b3-modal-drawer/div[1]/div[2]/div/div[1]/div/div[2]/div[1]/app-datepicker-composto/div/form/b3-datepicker/div/b3-message/small')
-    str_dt_limit_end = element.text.split(" ")[-1]
+    pagination_element = get_element(driver=driver, xpath=END_LIMIT_STRING_XPATH)
+    str_dt_limit_end = pagination_element.text.split(" ")[-1]
 
-    dt_filters = get_date_filters(start_date_limit=str_dt_limit, end_date_limit=str_dt_limit_end)
+    dt_filters = get_date_filters(start_date_limit=start_date, end_date_limit=str_dt_limit_end)
+
     for dt_filter in dt_filters:
+        await thread_filter(driver=driver, dt_filter=dt_filter)
 
-        input_start_element = get_element_by_class(driver, "input-start")
-        input_start_element.clear()
-        input_start_element.send_keys(dt_filter['start_date'].strftime('%d%m%Y'))
-
-        input_end_element = get_element_by_class(driver, "input-end")
-        input_end_element.clear()
-        input_end_element.send_keys(dt_filter['end_date'].strftime('%d%m%Y'))
-
-        # clica no botao filtrar
-        click_element(driver, "/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/app-movimentacao-filtrar/div/b3-modal-drawer/div[1]/div[2]/div/div[2]/b3-button[1]/button")
-
-        time.sleep(2)
-
-        get_assets(driver)
-
-        print('Verificar paginação....')
-
-        element = get_element(driver, xpath="//*[@id='paginacao-extrato-movimentacao']", raise_error=False)
-        if element:
-            print('Paginação encontrada, mapeando...')
-            next_page_element = get_element(driver,
-                                            xpath="/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/div/div/*/b3-paginator/div/nav/ul/b3-paginator-lateral-button[3]/li/a/b3-icon/span", raise_error=False)
-
-            if next_page_element:
-                print('Próxima página encontrada, navegando até ela...')
-                next_page_element.click()
-
-                while next_page_element:
-
-                    get_assets(driver)
-                    time.sleep(2)
-
-                    print('Procurando se existe próxima página...')
-                    xpath1 = "/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/div/div/*/b3-paginator/div/nav/ul/b3-paginator-lateral-button[3]/li/a/b3-icon/span"
-                    next_page_element = get_element(driver, xpath=xpath1, raise_error=False)
-
-                    try:
-                        next_page_element.click()
-                        print('Próxima página encontrada, navegando até ela...')
-                    except ElementClickInterceptedException:
-                        print('Próxima página não encontrada, finalizando navegação entre páginas.')
-                        next_page_element = None
-
-                    time.sleep(2)
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Tempo de execução: {execution_time:.6f} segundos")
 
 
-        # abre o filtro novamente
-        click_element(driver, "/html/body/app-root/app-core/div/div/app-extrato/div/app-movimentacao/div/app-tabela-filtro/div/div/b3-button[1]/button")
-
-        time.sleep(2)
-
-
-def first_function():
+async def first_function():
     driver = webdriver.Firefox()
     driver.set_window_position(-1300, 100)
     driver.maximize_window()
-
-    driver.get('https://www.investidor.b3.com.br/login?utm_source=B3_MVP&utm_medium=HM_PF&utm_campaign=menu')
-
+    driver.get(FIRST_PAGE_URL)
     assert "Área do Investidor | B3" in driver.title
 
     try:
         abrir_tela_movimentacao(driver)
-
-        definir_filtros(driver)
-
-        # time.sleep(60)
-
+        await definir_filtros(driver)
     except Exception as e:
         raise e
 
     finally:
-        # driver.quit()
+
+        driver.quit()
 
         # Salvar as transações no arquivo data.json
         with open('data.json', 'w', encoding='utf-8') as f:
@@ -282,6 +268,8 @@ def first_function():
 
         order_json()
 
+        print(f'\nScript executado com sucesso! Foram processadas {len(TRANSACTIONS)} transações no total.')
+
 
 if __name__ == '__main__':
-    first_function()
+    asyncio.run(first_function())
